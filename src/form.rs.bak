@@ -1,0 +1,971 @@
+use std::io::{Write, stdout};
+use std::any::Any;
+use crossterm::{
+    execute,
+    terminal::{Clear, ClearType, size, enable_raw_mode, disable_raw_mode},
+    cursor::{MoveTo, Show, Hide, position, MoveUp, MoveDown},
+    event::{read, Event, KeyCode, KeyModifiers},
+    style::{Print, Attribute, SetAttribute, Color, SetForegroundColor, ResetColor},
+    QueueableCommand,
+};
+
+use crate::error::FormError;
+use crate::input::{FormItem, text_input::TextInput, single_choice::SingleChoice, multiple_choice::MultipleChoice, time_input::TimeInput};
+
+// 表单项的状态
+#[derive(PartialEq)]
+enum ItemState {
+    Normal,      // 普通状态
+    Selected,    // 选中未编辑
+    Editing,     // 正在编辑
+    Completed,   // 已完成
+}
+
+pub struct FormItemWrapper {
+    pub item: Box<dyn FormItem<Output = Box<dyn Any>>>,
+    pub state: ItemState,
+    pub value: Option<Box<dyn Any>>,
+    pub y_pos: u16,   // 在表单中的纵向位置
+    pub height: u16,  // 表单项高度
+}
+
+pub struct Form {
+    pub items: Vec<FormItemWrapper>,
+    pub title: String,
+    pub current_index: usize,
+    pub start_y: u16,         // 表单开始的y坐标
+    pub scroll_offset: usize, // 滚动偏移量
+    pub visible_items: usize, // 可见项的数量
+}
+
+impl Form {
+    pub fn new(title: &str) -> Self {
+        Form {
+            items: Vec::new(),
+            title: title.to_string(),
+            current_index: 0,
+            start_y: 2,       // 标题下方两行开始
+            scroll_offset: 0, // 初始无滚动
+            visible_items: 0, // 初始时计算
+        }
+    }
+    
+    pub fn add_item(&mut self, item: Box<dyn FormItem<Output = Box<dyn Any>>>) {
+        // 初始状态下，只计算非展开状态的高度
+        let height = match item.get_type() {
+            "text" => 2,
+            "single_choice" | "multiple_choice" => 2, // 未展开时只占1行
+            "time" => 3,
+            _ => 2,
+        };
+        
+        let y_pos = if self.items.is_empty() {
+            self.start_y
+        } else {
+            let last_item = self.items.last().unwrap();
+            last_item.y_pos + last_item.height + 1
+        };
+        
+        self.items.push(FormItemWrapper {
+            item,
+            state: ItemState::Normal,
+            value: None,
+            y_pos,
+            height,
+        });
+    }
+    
+    pub fn process(&mut self) -> Result<Vec<Box<&dyn Any>>, FormError> {
+        // 清屏并启用原始模式
+        execute!(stdout(), Clear(ClearType::All))?;
+        enable_raw_mode()?;
+        
+        // 设置初始选中项的状态，但不执行任何验证
+        if (!self.items.is_empty()) {
+            self.items[0].state = ItemState::Selected;
+        }
+        
+        // 直接进入交互循环，不执行任何初始验证
+        self.run_form_loop()?;
+        
+        // 收集和返回结果
+        let mut results = Vec::new();
+        for item_wrapper in &self.items {
+            if let Some(val) = &item_wrapper.value {
+                // 修复错误1: 使用Box::new复制值而不是引用
+                results.push(Box::new(val.as_ref()));
+            } else {
+                // 对于未完成项，添加一个空值
+                results.push(Box::new(&()));
+            }
+        }
+        
+        Ok(results)
+    }
+    
+    // 将主循环逻辑移到单独的方法
+    fn run_form_loop(&mut self) -> Result<(), FormError> {
+        let mut running = true;
+        
+        // 计算初始可见项
+        let (_, term_height) = size()?;
+        // 减去标题(3行)和底部提示区域(2行)以及缓冲区(2行)
+        self.visible_items = (term_height as usize).saturating_sub(7); 
+        
+        while running {
+            self.display()?;
+            
+            // 处理用户输入
+            if let Event::Key(key) = read()? {
+                let current = &mut self.items[self.current_index];
+                
+                match current.state {
+                    ItemState::Editing => {
+                        // 如果当前项正在编辑，处理编辑模式下的按键
+                        let key_code = key.code;
+                        let key_modifiers = key.modifiers;
+                        let editing_completed = {
+                            let current = &mut self.items[self.current_index];
+                            self.process_editing_key(key_code, key_modifiers)?
+                        };
+                        if editing_completed {
+                            // 完成编辑
+                            let current = &mut self.items[self.current_index];
+                            current.state = ItemState::Completed;
+                            // 移至下一项
+                            if self.current_index < self.items.len() - 1 {
+                                self.current_index += 1;
+                                self.items[self.current_index].state = ItemState::Selected;
+                            } else if self.all_completed() {
+                                running = false;
+                            }
+                        }
+                    },
+                    _ => {
+                        // 非编辑模式下的导航键
+                        match key.code {
+                            KeyCode::Up if self.current_index > 0 => {
+                                self.items[self.current_index].state = ItemState::Normal;
+                                self.current_index -= 1;
+                                self.items[self.current_index].state = ItemState::Selected;
+                                
+                                // 向上滚动如果当前项在可见区域上方
+                                if self.current_index < self.scroll_offset {
+                                    self.scroll_offset = self.current_index;
+                                }
+                            },
+                            KeyCode::Down if self.current_index < self.items.len() - 1 => {
+                                self.items[self.current_index].state = ItemState::Normal;
+                                self.current_index += 1;
+                                self.items[self.current_index].state = ItemState::Selected;
+                                
+                                // 计算当前可见区域的结束索引
+                                let mut visible_height = 0;
+                                let mut visible_end = self.scroll_offset;
+                                
+                                // 累加每个可见项的高度，直到超出可见区域
+                                for idx in self.scroll_offset..self.items.len() {
+                                    visible_height += self.items[idx].height as usize + 1;
+                                    if visible_height > self.visible_items {
+                                        break;
+                                    }
+                                    visible_end = idx;
+                                }
+                                
+                                // 向下滚动如果当前项超出可见区域
+                                if self.current_index > visible_end {
+                                    // 向下滚动直到当前项可见
+                                    let mut scroll_to = self.scroll_offset;
+                                    while scroll_to < self.current_index {
+                                        visible_height = 0;
+                                        visible_end = scroll_to;
+                                        
+                                        for idx in scroll_to..self.items.len() {
+                                            visible_height += self.items[idx].height as usize + 1;
+                                            if visible_height > self.visible_items {
+                                                break;
+                                            }
+                                            visible_end = idx;
+                                        }
+                                        
+                                        if self.current_index <= visible_end {
+                                            break;
+                                        }
+                                        
+                                        scroll_to += 1;
+                                    }
+                                    
+                                    self.scroll_offset = scroll_to;
+                                }
+                            },
+                            KeyCode::Enter => {
+                                // 进入编辑模式
+                                self.items[self.current_index].state = ItemState::Editing;
+                            },
+                            KeyCode::Tab => {
+                                // 跳到下一个未完成项
+                                self.goto_next_incomplete()?;
+                            },
+                            KeyCode::Esc => {
+                                if self.confirm_exit()? {
+                                    running = false;
+                                }
+                            },
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 恢复终端设置
+        disable_raw_mode()?;
+        execute!(stdout(), Show)?;
+        execute!(stdout(), Clear(ClearType::All))?;
+        
+        Ok(())
+    }
+    
+    fn display(&self) -> Result<(), FormError> {
+        // 清屏并重新计算可见区域
+        execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
+        
+        // 获取终端高度
+        let (_, term_height) = size()?;
+        
+        // 显示标题
+        execute!(
+            stdout(),
+            SetAttribute(Attribute::Bold),
+            Print(format!("===== {} =====\n\n", self.title)),
+            SetAttribute(Attribute::Reset)
+        )?;
+        
+        // 动态调整每个项目的高度，选中或编辑状态时才展开
+        let mut adjusted_items: Vec<(usize, u16, u16)> = Vec::new(); // (索引, y位置, 高度)
+        let mut current_y = self.start_y;
+        
+        for (idx, item_wrapper) in self.items.iter().enumerate() {
+            let mut height = 2; // 默认高度
+            
+            // 根据项目状态和类型计算高度
+            if item_wrapper.state == ItemState::Selected || item_wrapper.state == ItemState::Editing {
+                match item_wrapper.item.get_type() {
+                    "single_choice" | "multiple_choice" => {
+                        // 选中时显示所有选项
+                        height = item_wrapper.item.get_options().len() as u16 + 3; // 标题 + 选项 + 提示
+                    }
+                    "time" => {
+                        height = 3; // 标题 + 提示
+                    }
+                    _ => {}
+                }
+            }
+            
+            adjusted_items.push((idx, current_y, height));
+            current_y += height + 1;
+        }
+        
+        // 计算可见区域，并确保当前项可见
+        let usable_height = term_height.saturating_sub(5);
+        
+        // 根据当前选中项调整滚动偏移
+        let mut scroll_offset = self.scroll_offset;
+        
+        // 寻找当前选中项在adjusted_items中的位置
+        if let Some(pos) = adjusted_items.iter().position(|(idx, _, _)| *idx == self.current_index) {
+            let (_, item_y, item_height) = adjusted_items[pos];
+            
+            // 检查当前选中项是否在可见区域内
+            let item_bottom = item_y + item_height;
+            let visible_bottom = self.start_y + usable_height;
+            
+            // 如果项目底部超出可见区域，调整scroll_offset使其完全可见
+            if item_bottom > visible_bottom {
+                // 向下滚动，使当前项完全可见
+                let items_before = &adjusted_items[0..pos];
+                scroll_offset = 0;
+                let mut accumulated_height = self.start_y;
+                
+                for (idx, _, h) in items_before {
+                    accumulated_height += h + 1;
+                    if accumulated_height + item_height > usable_height {
+                        scroll_offset = *idx + 1; // 滚动到当前项开始
+                        break;
+                    }
+                }
+            }
+            // 如果项目顶部在可见区域上方，调整scroll_offset
+            else if pos < scroll_offset {
+                scroll_offset = pos;
+            }
+        }
+        
+        // 显示可见项
+        let visible_items = adjusted_items
+            .iter()
+            .skip(scroll_offset)
+            .take_while(|(_, y, h)| *y + *h <= self.start_y + usable_height)
+            .collect::<Vec<_>>();
+        
+        // 显示滚动指示器（如果需要）
+        if scroll_offset > 0 {
+            execute!(stdout(), MoveTo(0, self.start_y - 1), Print("↑ 更多项 ↑"))?;
+        }
+        
+        // 显示表单项
+        for &(idx, y_pos, _) in &visible_items {
+            let item_wrapper = &self.items[*idx];
+            
+            let (prefix, color) = match item_wrapper.state {
+                ItemState::Normal => ("  ", Color::Reset),
+                ItemState::Selected => ("> ", Color::Yellow),
+                ItemState::Editing => ("> ", Color::Green),
+                ItemState::Completed => ("  ", Color::Reset),
+            };
+            
+            let status = match item_wrapper.state {
+                ItemState::Completed => "[✓] ",
+                _ => if item_wrapper.item.is_required() { "[_] " } else { "[ ] " },
+            };
+            
+            // 移至表单项位置
+            execute!(stdout(), MoveTo(0, *y_pos))?;
+            
+            // 显示表单项标签
+            execute!(
+                stdout(),
+                SetForegroundColor(color),
+                Print(prefix),
+                Print(status),
+                Print(item_wrapper.item.prompt()),
+                ResetColor
+            )?;
+            
+            // 显示表单项的值或编辑界面
+            match item_wrapper.item.get_type() {
+                "text" => {
+                    // 文本输入框，在同一行显示
+                    if item_wrapper.state == ItemState::Editing {
+                        execute!(stdout(), Print(": "), SetAttribute(Attribute::Underlined))?;
+                        let value = item_wrapper.item.get_current_value();
+                        execute!(stdout(), Print(value))?;
+                        execute!(stdout(), SetAttribute(Attribute::Reset))?;
+                    } else if item_wrapper.state == ItemState::Completed {
+                        execute!(stdout(), Print(": "))?;
+                        let value = item_wrapper.item.display_value();
+                        execute!(stdout(), Print(value))?;
+                    } else {
+                        execute!(stdout(), Print(": _______________"))?;
+                    }
+                },
+                "single_choice" | "multiple_choice" => {
+                    // 选择框，只在选中或编辑时显示选项
+                    if item_wrapper.state == ItemState::Completed {
+                        execute!(stdout(), Print(": "))?;
+                        let value = item_wrapper.item.display_value();
+                        execute!(stdout(), Print(value))?;
+                    } else if item_wrapper.state == ItemState::Selected || item_wrapper.state == ItemState::Editing {
+                        // 显示选项
+                        self.display_options(*idx, *y_pos, 1)?;
+                        
+                        // 在选项下方显示操作提示
+                        let options_count = item_wrapper.item.get_options().len();
+                        execute!(
+                            stdout(),
+                            MoveTo(4, y_pos + options_count as u16 + 1),
+                            Print("使用 ↑↓ 移动，空格选择，Enter 确认")
+                        )?;
+                    } else {
+                        // 未选中且未完成时，只显示简短提示
+                        execute!(stdout(), Print(": [选择项]"))?;
+                    }
+                },
+                "time" => {
+                    // 时间输入，格式: HH:MM-HH:MM
+                    if item_wrapper.state == ItemState::Editing {
+                        execute!(stdout(), Print(": "))?;
+                        let value = item_wrapper.item.get_current_value();
+                        execute!(stdout(), Print(value))?;
+                        
+                        // 显示控制提示
+                        execute!(
+                            stdout(), 
+                            MoveTo(4, item_wrapper.y_pos + 1),
+                            Print("使用 ←→ 键移动光标，↑↓ 键修改值，或直接输入数字")
+                        )?;
+                    } else if item_wrapper.state == ItemState::Completed {
+                        execute!(stdout(), Print(": "))?;
+                        let value = item_wrapper.item.display_value();
+                        execute!(stdout(), Print(value))?;
+                    } else {
+                        execute!(stdout(), Print(": __:__ - __:__"))?;
+                    }
+                },
+                _ => {}
+            }
+        }
+        
+        // 显示底部滚动指示器（如果需要）
+        if visible_items.len() < adjusted_items.len() - scroll_offset {
+            let last_item = visible_items.last().unwrap();
+            let (_, y, h) = *last_item;
+            execute!(stdout(), MoveTo(0, y + h + 1), Print("↓ 更多项 ↓"))?;
+        }
+        
+        // 显示底部导航提示
+        execute!(
+            stdout(), 
+            MoveTo(0, term_height - 2),
+            Print("使用 ↑↓ 键在表单项之间移动，Enter 进入编辑模式，Tab 跳至下一未完成项，Esc 退出")
+        )?;
+        
+        stdout().flush()?;
+        
+        // 如果某项正在编辑，将光标定位到正确位置
+        if let Some(wrapper) = self.items.get(self.current_index) {
+            if wrapper.state == ItemState::Editing {
+                let edit_x = wrapper.item.get_cursor_x();
+                // 根据表单项类型设置光标位置
+                let y_pos = if let Some((_, y, _)) = visible_items.iter().find(|(idx, _, _)| *idx == self.current_index) {
+                    *y
+                } else {
+                    wrapper.y_pos
+                };
+                
+                let edit_y = match wrapper.item.get_type() {
+                    "text" => y_pos,
+                    "single_choice" | "multiple_choice" => {
+                        y_pos + 1 + wrapper.item.get_cursor_pos() as u16
+                    },
+                    "time" => y_pos,
+                    _ => y_pos,
+                };
+                
+                execute!(stdout(), MoveTo(edit_x, edit_y), Show)?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn display_options(&self, idx: usize, y_pos: u16, y_offset: u16) -> Result<(), FormError> {
+        let wrapper = &self.items[idx];
+        let options = wrapper.item.get_options();
+        
+        for (i, option) in options.iter().enumerate() {
+            let marker = if wrapper.item.is_option_selected(i) { "[X]" } else { "[ ]" };
+            let option_style = if wrapper.state == ItemState::Editing && wrapper.item.get_cursor_pos() == i {
+                SetAttribute(Attribute::Bold)
+            } else {
+                SetAttribute(Attribute::Reset)
+            };
+            
+            execute!(
+                stdout(),
+                MoveTo(4, y_pos + y_offset + i as u16),
+                option_style,
+                Print(format!("{} {}", marker, option)),
+                SetAttribute(Attribute::Reset)
+            )?;
+        }
+        
+        Ok(())
+    }
+    
+    fn process_editing_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<bool, FormError> {
+        let current = &mut self.items[self.current_index];
+        
+        match current.item.get_type() {
+            "text" => {
+                match code {
+                    KeyCode::Enter => {
+                        // 完成文本输入
+                        let result = current.item.complete_editing()?;
+                        current.value = Some(result);
+                        return Ok(true);
+                    },
+                    KeyCode::Esc => {
+                        // 取消编辑
+                        current.state = ItemState::Selected;
+                        return Ok(false);
+                    },
+                    _ => {
+                        // 传递按键到文本输入处理
+                        current.item.handle_key_press(code, modifiers)?;
+                    }
+                }
+            },
+            "single_choice" | "multiple_choice" => {
+                match code {
+                    KeyCode::Up => {
+                        current.item.move_cursor_up()?;
+                    },
+                    KeyCode::Down => {
+                        current.item.move_cursor_down()?;
+                    },
+                    KeyCode::Char(' ') => {
+                        current.item.toggle_selection()?;
+                    },
+                    KeyCode::Enter => {
+                        // 完成选择
+                        let result = current.item.complete_editing()?;
+                        current.value = Some(result);
+                        return Ok(true);
+                    },
+                    KeyCode::Esc => {
+                        // 取消编辑
+                        current.state = ItemState::Selected;
+                        return Ok(false);
+                    },
+                    _ => {}
+                }
+            },
+            "time" => {
+                match code {
+                    KeyCode::Left => {
+                        current.item.move_cursor_left()?;
+                    },
+                    KeyCode::Right => {
+                        current.item.move_cursor_right()?;
+                    },
+                    KeyCode::Up => {
+                        current.item.increase_value()?;
+                    },
+                    KeyCode::Down => {
+                        current.item.decrease_value()?;
+                    },
+                    KeyCode::Char(c) if c.is_digit(10) => {
+                        current.item.input_digit(c)?;
+                    },
+                    KeyCode::Enter => {
+                        // 完成时间输入
+                        let result = current.item.complete_editing()?;
+                        current.value = Some(result);
+                        return Ok(true);
+                    },
+                    KeyCode::Esc => {
+                        // 取消编辑
+                        current.state = ItemState::Selected;
+                        return Ok(false);
+                    },
+                    _ => {}
+                }
+            },
+            _ => {}
+        }
+        
+        Ok(false)
+    }
+    
+    fn goto_next_incomplete(&mut self) -> Result<(), FormError> {
+        // 更新当前项状态
+        self.items[self.current_index].state = ItemState::Normal;
+        
+        // 找到下一个未完成项
+        let start_idx = self.current_index;
+        let mut idx = (start_idx + 1) % self.items.len();
+        
+        while idx != start_idx {
+            if self.items[idx].state != ItemState::Completed {
+                self.current_index = idx;
+                self.items[idx].state = ItemState::Selected;
+                
+                // 确保新选中的项在可见区域内
+                if idx < self.scroll_offset {
+                    // 如果在可见区域上方，则滚动到该项
+                    self.scroll_offset = idx;
+                } else {
+                    // 检查是否在可见区域下方
+                    let mut visible_height = 0;
+                    let mut visible_end = self.scroll_offset;
+                    
+                    for i in self.scroll_offset..self.items.len() {
+                        visible_height += self.items[i].height as usize + 1;
+                        if visible_height > self.visible_items {
+                            break;
+                        }
+                        visible_end = i;
+                    }
+                    
+                    if idx > visible_end {
+                        // 需要向下滚动
+                        let mut new_scroll_offset = self.scroll_offset;
+                        while new_scroll_offset < idx {
+                            let next_item_height = self.items[new_scroll_offset].height as usize + 1;
+                            visible_height -= next_item_height;
+                            new_scroll_offset += 1;
+                            
+                            // 从底部添加新项的高度
+                            if new_scroll_offset + visible_end - self.scroll_offset < self.items.len() {
+                                let new_item_idx = new_scroll_offset + visible_end - self.scroll_offset;
+                                visible_height += self.items[new_item_idx].height as usize + 1;
+                            }
+                            
+                            if visible_height <= self.visible_items && idx <= new_scroll_offset + visible_end - self.scroll_offset {
+                                break;
+                            }
+                        }
+                        
+                        self.scroll_offset = new_scroll_offset;
+                    }
+                }
+                
+                return Ok(());
+            }
+            idx = (idx + 1) % self.items.len();
+        }
+        
+        // 如果没有未完成项，保持当前选中
+        self.items[self.current_index].state = ItemState::Selected;
+        Ok(())
+    }
+    
+    fn all_completed(&self) -> bool {
+        self.items.iter().all(|item| {
+            !item.item.is_required() || item.state == ItemState::Completed
+        })
+    }
+    
+    fn confirm_exit(&self) -> Result<bool, FormError> {
+        // 显示确认对话框
+        let (width, height) = size()?;
+        let message = "确定要退出吗? 未保存的数据将丢失! (Y/N)";
+        
+        execute!(
+            stdout(),
+            MoveTo((width - message.len() as u16) / 2, height / 2),
+            Print(message)
+        )?;
+        
+        loop {
+            match read()? {
+                Event::Key(key) => match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(true),
+                    KeyCode::Char('n') | KeyCode::Char('N') => return Ok(false),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+
+    fn process_current_item(&mut self) -> Result<bool, FormError> {
+        let idx = self.current_index;
+        
+        // 临时禁用原始模式以允许表单项处理输入
+        disable_raw_mode()?;
+        
+        // 清屏并显示当前项
+        execute!(stdout(), Clear(ClearType::All))?;
+        execute!(
+            stdout(),
+            MoveTo(0, 0),
+            SetAttribute(Attribute::Bold),
+            // 修复错误4: 正确访问FormItem的prompt方法
+            Print(format!("正在编辑: {}\n\n", self.items[idx].item.prompt())),
+            SetAttribute(Attribute::Reset)
+        )?;
+        
+        // 处理编辑界面 - 基于表单项类型使用不同的编辑流程
+        let result = match self.items[idx].item.get_type() {
+            "text" => self.handle_text_editing(idx),
+            "single_choice" => self.handle_choice_editing(idx),
+            "multiple_choice" => self.handle_choice_editing(idx),
+            "time" => self.handle_time_editing(idx),
+            _ => Err(FormError::InvalidInput("未知表单项类型".to_string())),
+        };
+        
+        match result {
+            Ok(value) => {
+                self.items[idx].value = Some(value);
+                self.items[idx].state = ItemState::Completed;
+                enable_raw_mode()?;
+                Ok(true)
+            },
+            Err(e) => {
+                execute!(stdout(), MoveTo(0, 5), Print(format!("错误: {}", e)))?;
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                enable_raw_mode()?;
+                Ok(false)
+            }
+        }
+    }
+
+    // 处理文本输入编辑
+    fn handle_text_editing(&mut self, idx: usize) -> Result<Box<dyn Any>, FormError> {
+        let item = &mut self.items[idx].item;
+        
+        execute!(stdout(), Show)?;
+        
+        let mut running = true;
+        while running {
+            // 显示当前状态
+            execute!(stdout(), MoveTo(0, 2))?;
+            execute!(stdout(), Clear(ClearType::CurrentLine))?;
+            
+            execute!(stdout(), Print(format!("{}: ", item.prompt())))?;
+            let current_value = item.get_current_value();
+            execute!(stdout(), Print(&current_value))?;
+            
+            // 将光标放在正确的位置
+            let cursor_x = item.get_cursor_x();
+            execute!(stdout(), MoveTo(cursor_x, 2))?;
+            
+            // 读取按键
+            match read()? {
+                Event::Key(key) => {
+                    match key.code {
+                        KeyCode::Enter => {
+                            // 尝试完成编辑
+                            match item.complete_editing() {
+                                Ok(value) => {
+                                    running = false;
+                                    return Ok(value);
+                                }
+                                Err(e) => {
+                                    execute!(stdout(), MoveTo(0, 4), Print(format!("错误: {}", e)))?;
+                                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                                    execute!(stdout(), MoveTo(0, 4), Clear(ClearType::CurrentLine))?;
+                                }
+                            }
+                        },
+                        KeyCode::Esc => {
+                            // 取消编辑
+                            return Err(FormError::InvalidInput("已取消编辑".to_string()));
+                        },
+                        _ => {
+                            // 处理其他按键
+                            item.handle_key_press(key.code, key.modifiers)?;
+                        }
+                    }
+                },
+                _ => {}
+            }
+        }
+        
+        // 不应该到达这里
+        Err(FormError::InvalidInput("编辑过程意外终止".to_string()))
+    }
+
+    // 处理选择框编辑
+    fn handle_choice_editing(&mut self, idx: usize) -> Result<Box<dyn Any>, FormError> {
+        execute!(stdout(), Show)?;
+        
+        let mut running = true;
+        while running {
+            // 重新显示选项
+            {
+                let item = &self.items[idx].item;
+                self.display_item_with_options(idx)?;
+            }
+            
+            // 读取按键
+            match read()? {
+                Event::Key(key) => {
+                    let item = &mut self.items[idx].item;
+                    match key.code {
+                        KeyCode::Up => {
+                            item.move_cursor_up()?;
+                        },
+                        KeyCode::Down => {
+                            item.move_cursor_down()?;
+                        },
+                        KeyCode::Char(' ') => {
+                            item.toggle_selection()?;
+                        },
+                        KeyCode::Enter => {
+                            // 尝试完成选择
+                            match item.complete_editing() {
+                                Ok(value) => {
+                                    running = false;
+                                    return Ok(value);
+                                }
+                                Err(e) => {
+                                    let (_, height) = size()?;
+                                    execute!(stdout(), MoveTo(0, height - 4), Print(format!("错误: {}", e)))?;
+                                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                                    execute!(stdout(), MoveTo(0, height - 4), Clear(ClearType::CurrentLine))?;
+                                }
+                            }
+                        },
+                        KeyCode::Esc => {
+                            // 取消编辑
+                            return Err(FormError::InvalidInput("已取消编辑".to_string()));
+                        },
+                        _ => {}
+                    }
+                },
+                _ => {}
+            }
+        }
+        
+        // 不应该到达这里
+        Err(FormError::InvalidInput("编辑过程意外终止".to_string()))
+    }
+
+    // 处理时间输入编辑
+    fn handle_time_editing(&mut self, idx: usize) -> Result<Box<dyn Any>, FormError> {
+        let item = &mut self.items[idx].item;
+        
+        execute!(stdout(), Show)?;
+        
+        let mut running = true;
+        while running {
+            // 显示当前状态
+            execute!(stdout(), MoveTo(0, 2))?;
+            execute!(stdout(), Clear(ClearType::CurrentLine))?;
+            
+            execute!(stdout(), Print(format!("{}: ", item.prompt())))?;
+            let current_value = item.get_current_value();
+            execute!(stdout(), Print(&current_value))?;
+            
+            // 将光标放在正确的位置
+            let cursor_x = item.get_cursor_x();
+            execute!(stdout(), MoveTo(cursor_x, 2))?;
+            
+            // 读取按键
+            match read()? {
+                Event::Key(key) => {
+                    match key.code {
+                        KeyCode::Left => {
+                            item.move_cursor_left()?;
+                        },
+                        KeyCode::Right => {
+                            item.move_cursor_right()?;
+                        },
+                        KeyCode::Up => {
+                            item.increase_value()?;
+                        },
+                        KeyCode::Down => {
+                            item.decrease_value()?;
+                        },
+                        KeyCode::Char(c) if c.is_digit(10) => {
+                            item.input_digit(c)?;
+                        },
+                        KeyCode::Enter => {
+                            // 尝试完成编辑
+                            match item.complete_editing() {
+                                Ok(value) => {
+                                    running = false;
+                                    return Ok(value);
+                                }
+                                Err(e) => {
+                                    execute!(stdout(), MoveTo(0, 4), Print(format!("错误: {}", e)))?;
+                                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                                    execute!(stdout(), MoveTo(0, 4), Clear(ClearType::CurrentLine))?;
+                                }
+                            }
+                        },
+                        KeyCode::Esc => {
+                            // 取消编辑
+                            return Err(FormError::InvalidInput("已取消编辑".to_string()));
+                        },
+                        _ => {}
+                    }
+                },
+                _ => {}
+            }
+        }
+        
+        // 不应该到达这里
+        Err(FormError::InvalidInput("编辑过程意外终止".to_string()))
+    }
+
+    // 显示带选项的表单项
+    fn display_item_with_options(&self, idx: usize) -> Result<(), FormError> {
+        // 修复错误4: 正确访问item字段
+        let item = &self.items[idx].item;
+        
+        // 清屏
+        execute!(stdout(), Clear(ClearType::All))?;
+        
+        // 显示标题
+        execute!(
+            stdout(),
+            MoveTo(0, 0),
+            SetAttribute(Attribute::Bold),
+            Print(format!("正在编辑: {}\n\n", item.prompt())),
+            SetAttribute(Attribute::Reset)
+        )?;
+        
+        let options = item.get_options();
+        for (i, option) in options.iter().enumerate() {
+            let selected = item.is_option_selected(i);
+            let marker = if selected { "[X]" } else { "[ ]" };
+            let cursor = if i == item.get_cursor_pos() {
+                SetAttribute(Attribute::Bold)
+            } else {
+                SetAttribute(Attribute::Reset)
+            };
+            
+            execute!(
+                stdout(),
+                MoveTo(2, 2 + i as u16),
+                cursor,
+                Print(format!("{} {}", marker, option)),
+                SetAttribute(Attribute::Reset)
+            )?;
+        }
+        
+        // 显示操作指南
+        let (_, height) = size()?;
+        execute!(
+            stdout(), 
+            MoveTo(0, height - 3),
+            Print("使用 ↑↓ 移动，空格选择，Enter 确认，Esc 取消")
+        )?;
+        
+        Ok(())
+    }
+
+    // 添加一个通用的编辑处理方法作为后备
+    fn handle_generic_editing(&mut self, idx: usize) -> Result<Box<dyn Any>, FormError> {
+        // 由于这是后备方法，我们尽量避免验证，只返回当前值
+        let item = &mut self.items[idx].item;
+        // 显示基本提示
+        execute!(
+            stdout(),
+            Clear(ClearType::All),
+            MoveTo(0, 0),
+            SetAttribute(Attribute::Bold),
+            Print(format!("编辑 {}\n\n按Enter确认，Esc取消", item.prompt())),
+            SetAttribute(Attribute::Reset)
+        )?;
+        
+        execute!(stdout(), Show)?;
+        
+        // 简单的循环等待用户按Enter确认或Esc取消
+        loop {
+            match read()? {
+                Event::Key(key) => match key.code {
+                    KeyCode::Enter => {
+                        // 当用户按下Enter时，我们尝试完成编辑，但捕获任何验证错误
+                        // 这可能会显示错误消息，但不会退出程序
+                        match item.complete_editing() {
+                            Ok(value) => return Ok(value),
+                            Err(e) => {
+                                execute!(stdout(), MoveTo(0, 4), Print(format!("错误: {}", e)))?;
+                                std::thread::sleep(std::time::Duration::from_millis(1500));
+                                execute!(stdout(), MoveTo(0, 4), Clear(ClearType::CurrentLine))?;
+                            }
+                        }
+                    },
+                    KeyCode::Esc => {
+                        return Err(FormError::InvalidInput("已取消编辑".to_string()));
+                    },
+                    _ => {
+                        // 对于其他键，尝试处理它们
+                        let _ = item.handle_key_press(key.code, key.modifiers);
+                        // 重新显示当前状态
+                        execute!(stdout(), MoveTo(0, 2), Clear(ClearType::CurrentLine))?;
+                        execute!(stdout(), Print(format!("{}: ", item.prompt())))?;
+                        let value = item.get_current_value();
+                        execute!(stdout(), Print(value))?;
+                    }
+                },
+                _ => {}
+            }
+        }
+    }
+}
